@@ -2,23 +2,9 @@ import express from "express";
 import fs from "fs";
 import { execFile } from "child_process";
 import fetch from "node-fetch";
-import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
-
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "normalized";
-
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  throw new Error("Missing Supabase env vars");
-}
-
-const supabase = createClient(
-  SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY
-);
 
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
@@ -29,30 +15,49 @@ function run(cmd, args) {
   });
 }
 
+app.get("/health", (_, res) => {
+  res.json({ ok: true });
+});
+
+/**
+ * POST /normalize
+ * Body:
+ * {
+ *   "download_url": "https://...signed...",
+ *   "upload_url": "https://...signed...",
+ *   "fps": 60,          // opcional
+ *   "crf": 18           // opcional
+ * }
+ */
 app.post("/normalize", async (req, res) => {
   try {
-    const { source_url, dest_path } = req.body || {};
-    if (!source_url) {
-      return res.status(400).json({ error: "source_url is required" });
-    }
+    const { download_url, upload_url, fps, crf } = req.body || {};
+
+    if (!download_url) return res.status(400).json({ error: "download_url is required" });
+    if (!upload_url) return res.status(400).json({ error: "upload_url is required" });
+
+    const outFps = Number.isFinite(Number(fps)) ? String(fps) : "60";
+    const outCrf = Number.isFinite(Number(crf)) ? String(crf) : "18";
 
     const inFile = `/tmp/in_${Date.now()}.webm`;
     const outFile = `/tmp/out_${Date.now()}.mp4`;
 
-    const r = await fetch(source_url);
-    if (!r.ok) throw new Error("Failed to download source_url");
+    // 1) Download WebM (signed URL)
+    const r = await fetch(download_url);
+    if (!r.ok) throw new Error(`Failed to download: ${r.status} ${r.statusText}`);
     fs.writeFileSync(inFile, Buffer.from(await r.arrayBuffer()));
 
+    // 2) Convert to MP4 (H.264 + AAC, CFR)
     await run("ffmpeg", [
       "-y",
       "-i", inFile,
       "-map", "0:v:0",
       "-map", "0:a?",
-      "-vf", "fps=60",
+      "-vf", `fps=${outFps}`,
       "-vsync", "cfr",
       "-c:v", "libx264",
       "-preset", "veryfast",
-      "-crf", "18",
+      "-crf", outCrf,
       "-profile:v", "high",
       "-pix_fmt", "yuv420p",
       "-movflags", "+faststart",
@@ -61,35 +66,31 @@ app.post("/normalize", async (req, res) => {
       outFile
     ]);
 
-    const key = dest_path || `highlights/${Date.now()}.mp4`;
+    // 3) Upload MP4 using signed upload URL (PUT)
     const mp4 = fs.readFileSync(outFile);
 
-    const { error } = await supabase.storage
-      .from(SUPABASE_BUCKET)
-      .upload(key, mp4, {
-        contentType: "video/mp4",
-        upsert: true
-      });
+    const up = await fetch(upload_url, {
+      method: "PUT",
+      headers: {
+        "content-type": "video/mp4",
+        "content-length": String(mp4.length),
+      },
+      body: mp4,
+    });
 
-    if (error) throw error;
+    if (!up.ok) {
+      const txt = await up.text().catch(() => "");
+      throw new Error(`Upload failed: ${up.status} ${up.statusText} ${txt}`);
+    }
 
-    const { data } = supabase.storage
-      .from(SUPABASE_BUCKET)
-      .getPublicUrl(key);
-
+    // cleanup
     try { fs.unlinkSync(inFile); } catch {}
     try { fs.unlinkSync(outFile); } catch {}
 
-    return res.json({
-      normalized_url: data.publicUrl
-    });
+    return res.json({ success: true });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
-});
-
-app.get("/health", (_, res) => {
-  res.json({ ok: true });
 });
 
 app.listen(process.env.PORT || 8080, () => {
